@@ -4,6 +4,7 @@
 // - Lee variables desde ENV (.env en local / Render en producción)
 // - CORS seguro (whitelist base + CORS_ORIGIN por ENV; permite no-origin: curl/Postman)
 // - Healthcheck para Render: GET /health
+// - Debug opcional blindado por ENV: GET ${DEBUG_URL} (si existe y empieza con '/')
 // - Endpoint de contacto: POST /api/contact
 // ============================================================
 
@@ -79,6 +80,35 @@ app.use(express.json({ limit: "1mb" }));
 // ============================================================
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 app.get("/", (_req, res) => res.send("Servidor backend funcionando 🚀"));
+
+// ============================================================
+// Debug opcional (blindado)
+// - Solo se registra si DEBUG_URL existe y comienza con '/'
+// - Útil para chequear variables críticas en prod sin romper el deploy
+// ============================================================
+const DEBUG_URL = (process.env.DEBUG_URL || "").trim();
+if (DEBUG_URL) {
+  if (DEBUG_URL.startsWith("/")) {
+    app.get(DEBUG_URL, (_req, res) => {
+      res.status(200).json({
+        ok: true,
+        path: DEBUG_URL,
+        envs: {
+          SMTP_HOST: !!process.env.SMTP_HOST,
+          SMTP_PORT: !!process.env.SMTP_PORT,
+          SMTP_USER: !!process.env.SMTP_USER,
+          SMTP_PASS: !!process.env.SMTP_PASS,
+          CONTACT_TO: !!process.env.CONTACT_TO,
+          CORS_ORIGIN: process.env.CORS_ORIGIN || "",
+        },
+        time: new Date().toISOString(),
+      });
+    });
+    console.log(`Ruta de debug habilitada en ${DEBUG_URL}`);
+  } else {
+    console.warn("DEBUG_URL debe comenzar con '/'. Se ignora:", DEBUG_URL);
+  }
+}
 
 // ============================================================
 // Endpoint: POST /api/contact
