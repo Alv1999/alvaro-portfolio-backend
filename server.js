@@ -1,45 +1,90 @@
 // alvaro-portfolio-backend/server.js
 // ============================================================
-// Backend de contacto: Express + Nodemailer (Gmail App Password)
-// - Lee .env (SMTP_* y CONTACT_TO)
-// - CORS permitido para Live Server y tu GitHub Pages
-// - Endpoint: POST /api/contact (nombre, email, telefono, mensaje, asunto opcional)
+// Backend de contacto (Express + Nodemailer con Gmail App Password)
+// - Lee variables desde ENV (.env en local / Render en producción)
+// - CORS seguro (whitelist base + CORS_ORIGIN por ENV; permite no-origin: curl/Postman)
+// - Healthcheck para Render: GET /health
+// - Endpoint de contacto: POST /api/contact
 // ============================================================
 
-require("dotenv").config(); // lee variables de .env
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const nodemailer = require("nodemailer");
 
 const app = express();
+app.disable("x-powered-by"); // Oculta header de Express
 
-// --- CORS ---
-// Permitimos Live Server en local. Más adelante agregamos GitHub Pages / dominio.
-const whitelist = [
+// ============================================================
+// Validación de variables requeridas al inicio (falla temprano)
+// ============================================================
+const REQUIRED_ENVS = [
+  "SMTP_HOST",
+  "SMTP_PORT",
+  "SMTP_USER",
+  "SMTP_PASS",
+  "CONTACT_TO",
+];
+const missing = REQUIRED_ENVS.filter((k) => !process.env[k]);
+if (missing.length) {
+  console.warn("⚠️ Faltan variables de entorno:", missing.join(", "));
+  // No hacemos process.exit() para no romper el deploy; fallará el envío si falta algo.
+}
+
+// ============================================================
+// CORS
+// ============================================================
+// Whitelist base (local + GitHub Pages)
+const baseWhitelist = [
   "http://127.0.0.1:5500",
   "http://localhost:5500",
-  "https://alv1999.github.io", // tu user page
-  // "https://alv1999.github.io/tu-repo", // cuando publiques el front en Pages, si lo usás
+  "http://localhost:5173", // Vite local
+  "http://127.0.0.1:5173",
+  "https://alv1999.github.io",
 ];
 
-app.use(
-  cors({
-    origin(origin, cb) {
-      // permite herramientas sin origin (curl, Postman) y valida navegadores
-      if (!origin || whitelist.some((w) => origin.startsWith(w)))
-        return cb(null, true);
-      cb(new Error("CORS: origen no permitido -> " + origin));
-    },
-  })
-);
+// Orígenes extra desde ENV (separados por coma)
+const envOrigins = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-app.use(express.json());
+// Lista final sin duplicados
+const WHITELIST = [...new Set([...baseWhitelist, ...envOrigins])];
 
-// --- Salud ---
+// Opciones de CORS
+const corsOptions = {
+  origin(origin, cb) {
+    // Permite herramientas sin "origin" (curl/Postman/crons)
+    if (!origin) return cb(null, true);
+
+    // Coincidencia exacta o que comience igual (útil con subrutas)
+    const allowed = WHITELIST.some((w) => origin === w || origin.startsWith(w));
+    if (allowed) return cb(null, true);
+
+    return cb(new Error("CORS: origen no permitido → " + origin));
+  },
+  optionsSuccessStatus: 200,
+};
+
+app.use(cors(corsOptions));
+// Responde preflight explícitamente (algunos proxies son sensibles)
+app.options("*", cors(corsOptions));
+
+// Body parser (subí el límite si un día adjuntás algo grande)
+app.use(express.json({ limit: "1mb" }));
+
+// ============================================================
+// Healthchecks
+// ============================================================
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 app.get("/", (_req, res) => res.send("Servidor backend funcionando 🚀"));
 
-// --- Endpoint: /api/contact ---
-app.post("/api/contact", async (req, res) => {
+// ============================================================
+// Endpoint: POST /api/contact
+// body: { nombre, email, telefono?, mensaje, asunto? }
+// ============================================================
+app.post("/api/contact", async (req, res, next) => {
   try {
     const { nombre, email, telefono, mensaje, asunto } = req.body || {};
 
@@ -49,19 +94,29 @@ app.post("/api/contact", async (req, res) => {
         .status(400)
         .json({ ok: false, error: "Faltan campos requeridos" });
     }
+    if (!isEmail(email)) {
+      return res.status(400).json({ ok: false, error: "Email inválido" });
+    }
 
-    // Transport SMTP con Gmail App Password (desde .env)
+    // Config SMTP (Gmail)
+    const smtpPort = Number(process.env.SMTP_PORT || 465);
+    const smtpSecure =
+      process.env.SMTP_SECURE !== undefined
+        ? String(process.env.SMTP_SECURE) === "true"
+        : smtpPort === 465; // por defecto true si 465
+
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST, // smtp.gmail.com
-      port: Number(process.env.SMTP_PORT), // 465
-      secure: process.env.SMTP_SECURE === "true", // true
+      port: smtpPort, // 465
+      secure: smtpSecure, // true
       auth: {
         user: process.env.SMTP_USER, // tu gmail
-        pass: process.env.SMTP_PASS, // app password SIN espacios (16 chars)
+        pass: process.env.SMTP_PASS, // app password (16 chars)
       },
+      tls: { minVersion: "TLSv1.2" }, // endurece TLS (Gmail lo soporta)
     });
 
-    // Verificación opcional (útil en dev; si falla, seguimos intentando enviar igual)
+    // Verificación opcional (no frena el envío si falla)
     try {
       await transporter.verify();
       console.log("SMTP listo ✅");
@@ -72,12 +127,10 @@ app.post("/api/contact", async (req, res) => {
       );
     }
 
-    // Subject dinámico con "asunto" si vino
     const subject = asunto
       ? `(${asunto}) Nuevo mensaje de ${nombre}`
       : `Nuevo mensaje de ${nombre}`;
 
-    // Cuerpo en texto plano (robusto)
     const text = `Nombre: ${nombre}
 Email: ${email}
 Teléfono: ${telefono || "-"}
@@ -85,21 +138,22 @@ Asunto: ${asunto || "-"}
 Mensaje:
 ${mensaje}`;
 
-    // (Opcional) versión HTML
     const html = `
       <h2>Nuevo contacto desde tu portfolio 🚀</h2>
-      <p><b>Nombre:</b> ${nombre}</p>
-      <p><b>Email:</b> ${email}</p>
-      <p><b>Teléfono:</b> ${telefono || "-"}</p>
-      <p><b>Asunto:</b> ${asunto || "-"}</p>
+      <p><b>Nombre:</b> ${escapeHtml(nombre)}</p>
+      <p><b>Email:</b> ${escapeHtml(email)}</p>
+      <p><b>Teléfono:</b> ${escapeHtml(telefono || "-")}</p>
+      <p><b>Asunto:</b> ${escapeHtml(asunto || "-")}</p>
       <p><b>Mensaje:</b></p>
-      <pre style="white-space:pre-wrap;font-family:inherit">${mensaje}</pre>
+      <pre style="white-space:pre-wrap;font-family:inherit">${escapeHtml(
+        mensaje
+      )}</pre>
     `;
 
     const info = await transporter.sendMail({
       from: `"Portfolio Web" <${process.env.SMTP_USER}>`,
-      to: process.env.CONTACT_TO, // a dónde te llega (tu mail)
-      replyTo: email, // para que al responder vaya al remitente
+      to: process.env.CONTACT_TO,
+      replyTo: email,
       subject,
       text,
       html,
@@ -111,15 +165,44 @@ ${mensaje}`;
     });
     return res.json({ ok: true, messageId: info.messageId });
   } catch (err) {
-    console.error("Error enviando correo ❌", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(err?.message || err) });
+    return next(err);
   }
 });
 
-// --- Arranque ---
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`API escuchando en http://localhost:${PORT}`);
+// ============================================================
+// 404 y manejador de errores
+// ============================================================
+app.use((_req, res) =>
+  res.status(404).json({ ok: false, error: "Ruta no encontrada" })
+);
+
+app.use((err, _req, res, _next) => {
+  console.error("Error no controlado ❌", err);
+  const msg = err?.message || "Error interno";
+  res.status(500).json({ ok: false, error: msg });
 });
+
+// ============================================================
+// Start
+// ============================================================
+const PORT = Number(process.env.PORT) || 4000;
+app.listen(PORT, () => {
+  console.log(`API escuchando en puerto ${PORT}`);
+  console.log("CORS whitelist:", WHITELIST.join(", ") || "(vacía)");
+});
+
+// ============================================================
+// Helpers
+// ============================================================
+function escapeHtml(str = "") {
+  return String(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function isEmail(s = "") {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s).trim());
+}
